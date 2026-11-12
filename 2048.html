@@ -139,7 +139,7 @@
     font-weight: 800;
     font-size: calc(var(--cell) * .44);
     font-variant-numeric: tabular-nums;
-    background: #eee4da; color: var(--ink);
+    background: #eee4da; color: #776e65;
   }
   .tile.d4 .face { font-size: calc(var(--cell) * .36); }
   .tile.d5 .face { font-size: calc(var(--cell) * .29); }
@@ -175,6 +175,7 @@
   }
   .overlay[hidden] { display: none; }
   .overlay p { margin: 0; font-size: 34px; font-weight: 800; }
+  .overlay .stats { font-size: 14px; font-weight: 600; opacity: .75; }
   .overlay.dead { background: rgba(238, 228, 218, .55); }
   @keyframes fade { from { opacity: 0; } }
 
@@ -187,6 +188,23 @@
   }
   .shake { animation: shake 260ms ease; }
   @keyframes shake { 25% { transform: translateX(-4px); } 75% { transform: translateX(4px); } }
+
+  /* 暗色模式：跟随系统外观，方块经典配色两种模式下都可用 */
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #2a2724;
+      --board: #443e38;
+      --slot: rgba(238, 228, 218, .1);
+      --ink: #d9d0c5;
+      --ink-soft: #998f83;
+    }
+    .btn.ghost { background: #5c544b; }
+    kbd { background: #3a352f; box-shadow: 0 1px 0 #1b1916; }
+    .hints i { background: rgba(0, 0, 0, .5); }
+    .overlay { background: rgba(42, 39, 36, .82); }
+    .overlay.dead { background: rgba(24, 22, 19, .72); }
+    .vbig .face { background: #d4cabf; color: #3c3a32; }
+  }
 </style>
 </head>
 <body>
@@ -226,6 +244,7 @@
     </div>
     <div class="overlay" id="overlay" hidden>
       <p id="overlayText"></p>
+      <p class="stats" id="overlayStats"></p>
       <div class="btns">
         <button class="btn" id="again">再来一局</button>
         <button class="btn ghost" id="keep" hidden>继续</button>
@@ -253,13 +272,15 @@
   const $ = (id) => document.getElementById(id);
   const board = $('board'), cellsLayer = $('cells'), tilesLayer = $('tiles');
   const scoreEl = $('score'), bestEl = $('best'), gainEl = $('gain');
-  const overlay = $('overlay'), overlayText = $('overlayText'), keepBtn = $('keep');
+  const overlay = $('overlay'), overlayText = $('overlayText'), overlayStats = $('overlayStats'), keepBtn = $('keep');
   const undoBtn = $('undo'), sizeSel = $('size'), goalEl = $('goal');
   const hintsEl = $('hints'), hintArrows = [...hintsEl.querySelectorAll('i')];
   const bestKey = () => '2048-best-' + N;
+  const saveKey = () => '2048-save-' + N;
 
   let gap = 0, cell = 0;
   let grid, tiles, ids, score, best, history, won, keepPlaying, finished;
+  let moves = 0, merges = 0, startedAt = 0, elapsed = 0, running = false;
 
   /* ---------- 音效（Web Audio 现场合成，无音频文件） ---------- */
   const soundBtn = $('sound');
@@ -378,22 +399,50 @@
     return { cells, score };
   }
 
+  /* ---------- 断点续玩（自动存档） ---------- */
+  function saveGame() {
+    if (finished) { localStorage.removeItem(saveKey()); return; }
+    const snap = snapshot();
+    snap.won = won; snap.keepPlaying = keepPlaying;
+    snap.moves = moves; snap.merges = merges;
+    snap.elapsed = elapsed + (running ? Date.now() - startedAt : 0);
+    try { localStorage.setItem(saveKey(), JSON.stringify(snap)); } catch (e) { /* 存满就算了 */ }
+  }
+
+  function loadSaved() {
+    try {
+      const raw = localStorage.getItem(saveKey());
+      if (!raw) return null;
+      const snap = JSON.parse(raw);
+      if (!Array.isArray(snap.cells) || snap.cells.length !== N * N) return null;
+      return snap;
+    } catch (e) { return null; }
+  }
+
   function restore(snap) {
     tilesLayer.textContent = '';
     grid = emptyGrid();
     tiles = [];
     ids = 0;
     score = snap.score;
+    // 撤销的历史快照没有统计字段，只有读档才有——别把它们清零
+    if (snap.moves !== undefined) moves = snap.moves;
+    if (snap.merges !== undefined) merges = snap.merges;
+    if (snap.elapsed !== undefined) elapsed = snap.elapsed;
+    startedAt = Date.now(); running = true;
+    history = []; // 撤销历史不持久化，读档后从当前局面重新计
     for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
       const v = snap.cells[r * N + c];
       if (v) { const t = makeTile(v, r, c); t.isNew = false; t.el.classList.remove('new'); tiles.push(t); grid[r][c] = t; }
     }
     let anyBig = false;
     for (const t of tiles) if (t.value >= GOAL) anyBig = true;
-    won = anyBig;
+    won = snap.won !== undefined ? !!snap.won : anyBig;
+    keepPlaying = !!snap.keepPlaying;
     finished = false;
     hideOverlay();
     syncHud();
+    saveGame();
   }
 
   /* ---------- 移动 ---------- */
@@ -444,8 +493,10 @@
       board.classList.add('shake');
       // 死局也可能出现在“没有有效移动”的时候，这里补一次判定
       if (!canMove()) {
+        running = false; elapsed += Date.now() - startedAt;
         finished = true;
         sfxLose();
+        localStorage.removeItem(saveKey());
         setTimeout(() => showOverlay('游戏结束', false), 200);
       }
       return false;
@@ -454,6 +505,8 @@
     history.push(before);
     if (history.length > MAX_HISTORY) history.shift();
     score += gained;
+    moves++;
+    if (dying.length) merges += dying.length;
     if (gained) { showGain(gained); sfxMerge(maxMerged); }
 
     // 动画：滑到新位置
@@ -469,13 +522,17 @@
 
     spawn();
     syncHud();
+    saveGame();
 
     if (hitGoal && !keepPlaying) {
+      running = false; elapsed += Date.now() - startedAt;
       sfxWin();
       setTimeout(() => showOverlay('你赢了！', true), 260);
     } else if (!canMove()) {
+      running = false; elapsed += Date.now() - startedAt;
       finished = true;
       sfxLose();
+      localStorage.removeItem(saveKey());
       setTimeout(() => showOverlay('游戏结束', false), 320);
     }
     return true;
@@ -511,8 +568,21 @@
     gainEl.classList.add('go');
   }
 
+  function fmtTime(ms) {
+    const s = Math.floor(ms / 1000);
+    const m = Math.floor(s / 60);
+    return m ? m + ' 分 ' + (s % 60) + ' 秒' : s + ' 秒';
+  }
+
+  function statsText() {
+    let maxV = 0;
+    for (const t of tiles) if (t.value > maxV) maxV = t.value;
+    return `步数 ${moves} · 用时 ${fmtTime(elapsed)} · 最大 ${maxV} · 合并 ${merges} 次`;
+  }
+
   function showOverlay(text, win) {
     overlayText.textContent = text;
+    overlayStats.textContent = statsText();
     overlay.classList.toggle('dead', !win);
     keepBtn.hidden = !win;
     overlay.hidden = false;
@@ -527,7 +597,9 @@
     ids = 0;
     score = 0;
     history = [];
+    moves = 0; merges = 0; elapsed = 0; startedAt = Date.now(); running = true;
     won = false; keepPlaying = false; finished = false;
+    localStorage.removeItem(saveKey());
     hideOverlay();
     spawn(); spawn();
     syncHud();
@@ -618,19 +690,25 @@
     GOAL = GOALS[N];
     goalEl.textContent = GOAL;
     best = Number(localStorage.getItem(bestKey()) || 0);
-    reset();
+    const s = loadSaved();
+    if (s) restore(s); else reset();
     layout();
   });
   $('again').addEventListener('click', reset);
   undoBtn.addEventListener('click', undo);
   soundBtn.addEventListener('click', toggleSound);
-  keepBtn.addEventListener('click', () => { keepPlaying = true; hideOverlay(); });
+  keepBtn.addEventListener('click', () => {
+    keepPlaying = true;
+    running = true; startedAt = Date.now(); // 恢复计时
+    hideOverlay();
+  });
 
   new ResizeObserver(layout).observe(board);
 
   goalEl.textContent = GOAL;
   best = Number(localStorage.getItem(bestKey()) || 0);
-  reset();
+  const saved = loadSaved();
+  if (saved) restore(saved); else reset();
   layout();
 
   // 供自动化测试驱动
